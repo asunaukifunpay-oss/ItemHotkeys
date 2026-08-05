@@ -10,22 +10,27 @@ import java.util.function.Predicate;
 
 public final class AntiFlyHandler {
     /*
-     * Анти-Флай не проходит через хотбар и основную руку.
-     * Он напрямую меняется местами со второй рукой.
+     * Анти-Флай напрямую меняется местами с offhand.
+     *
+     * Выбранный слот хотбара и основная рука
+     * вообще не меняются.
      */
-    private static final int OFFHAND_MOVE_DELAY = 7;
-    private static final int BEFORE_SNEAK_DELAY = 5;
-    private static final int SNEAK_HOLD_DELAY = 7;
-    private static final int AFTER_SNEAK_DELAY = 4;
-    private static final int OFFHAND_RESTORE_DELAY = 8;
+    private static final int OFFHAND_MOVE_DELAY = 2;
+    private static final int BEFORE_SNEAK_DELAY = 1;
+    private static final int SNEAK_HOLD_DELAY = 2;
+    private static final int AFTER_SNEAK_DELAY = 1;
+    private static final int OFFHAND_RESTORE_DELAY = 3;
 
     /*
-     * Максимальное ожидание серверного сообщения:
-     * 40 тиков ≈ 2 секунды.
+     * Если сообщение сервера не пришло, предмет всё равно
+     * возвращается через 15 тиков — примерно 0,75 секунды.
      */
-    private static final int CONFIRM_TIMEOUT_TICKS = 40;
+    private static final int CONFIRM_TIMEOUT_TICKS = 15;
 
-    private static final int ACTION_TIMEOUT_TICKS = 120;
+    /*
+     * Полный аварийный тайм-аут.
+     */
+    private static final int ACTION_TIMEOUT_TICKS = 60;
 
     private static Predicate<ItemStack> matcher;
     private static String displayName;
@@ -40,12 +45,8 @@ public final class AntiFlyHandler {
 
     private static boolean sneakPressedByMod;
     private static boolean serverConfirmed;
-
-    /*
-     * Становится true только после подтверждения,
-     * что Анти-Флай действительно оказался в offhand.
-     */
     private static boolean offhandPrepared;
+    private static boolean restoreSent;
 
     private static int delayTicks;
     private static int totalTicks;
@@ -64,8 +65,9 @@ public final class AntiFlyHandler {
         }
 
         if (!canWork(client)) {
+            VisualSwapState.end();
             clearState();
-            ActionController.finish(10);
+            ActionController.finish(5);
             return;
         }
 
@@ -84,28 +86,24 @@ public final class AntiFlyHandler {
                             + itemDisplayName
             );
 
+            VisualSwapState.end();
             clearState();
-            ActionController.finish(10);
-            return;
-        }
-
-        if (itemMatcher.test(
-                client.player.getOffHandStack()
-        )) {
-            ItemHotkeysClient.showMessage(
-                    client,
-                    "§eАнти-Флай уже находится "
-                            + "во второй руке."
-            );
-
-            clearState();
-            ActionController.finish(10);
+            ActionController.finish(5);
             return;
         }
 
         matcher = itemMatcher;
         displayName = itemDisplayName;
         sourceInventoryIndex = foundIndex;
+
+        /*
+         * Сохраняем визуальные предметы обеих рук.
+         *
+         * После настоящего переноса Анти-Флая во вторую
+         * руку игрок продолжит визуально видеть прежний
+         * предмет offhand.
+         */
+        VisualSwapState.begin();
 
         attackWasPressed =
                 client.options.attackKey.isPressed();
@@ -118,15 +116,16 @@ public final class AntiFlyHandler {
                         || client.player.isSneaking();
 
         /*
-         * Убираем конфликтующие действия на время
-         * активации.
+         * На время последовательности останавливаем
+         * конфликтующие ЛКМ и ПКМ.
          */
         client.options.attackKey.setPressed(false);
         client.options.useKey.setPressed(false);
 
         /*
-         * Если игрок уже сидел на Shift, сначала
-         * приводим сервер в состояние RELEASE.
+         * Если игрок уже держит Shift, сначала отправляем
+         * отпускание, чтобы последующее нажатие Shift
+         * являлось отдельным событием.
          */
         if (sneakWasPressed) {
             client.options.sneakKey.setPressed(false);
@@ -139,19 +138,20 @@ public final class AntiFlyHandler {
         }
 
         /*
-         * Прямой обмен:
+         * Настоящий обмен:
          *
          * исходный слот Анти-Флая ↔ offhand.
          *
          * Основная рука и выбранный слот хотбара
-         * вообще не меняются.
+         * при этом не меняются.
          */
         InventoryUtil.swapInventorySlotWithOffhand(
                 client,
                 sourceInventoryIndex
         );
 
-        stage = ActionStage.ANTI_FLY_VERIFY_OFFHAND;
+        stage =
+                ActionStage.ANTI_FLY_VERIFY_OFFHAND;
 
         delayTicks = OFFHAND_MOVE_DELAY;
         totalTicks = 0;
@@ -160,6 +160,7 @@ public final class AntiFlyHandler {
         sneakPressedByMod = false;
         serverConfirmed = false;
         offhandPrepared = false;
+        restoreSent = false;
     }
 
     public static void tick(
@@ -172,6 +173,7 @@ public final class AntiFlyHandler {
         }
 
         if (!canWork(client)) {
+            VisualSwapState.end();
             clearState();
             ActionController.resetWithoutRecovery();
             return;
@@ -180,10 +182,19 @@ public final class AntiFlyHandler {
         totalTicks++;
 
         if (totalTicks > ACTION_TIMEOUT_TICKS) {
-            ActionController.cancel(
+            /*
+             * При общем тайм-ауте сначала пытаемся
+             * вернуть предмет.
+             */
+            recover(client);
+
+            ItemHotkeysClient.showMessage(
                     client,
-                    "Анти-Флай отменён из-за тайм-аута."
+                    "§cАнти-Флай отменён "
+                            + "из-за тайм-аута."
             );
+
+            ActionController.finish(8);
             return;
         }
 
@@ -217,7 +228,7 @@ public final class AntiFlyHandler {
                     afterSneakRelease();
 
             case ANTI_FLY_WAIT_FOR_SERVER_CONFIRMATION ->
-                    waitForServerConfirmation(client);
+                    waitForServerConfirmation();
 
             case ANTI_FLY_RESTORE_OFFHAND ->
                     restoreOffhand(client);
@@ -233,8 +244,7 @@ public final class AntiFlyHandler {
 
             default -> ActionController.cancel(
                     client,
-                    "Получен неправильный этап "
-                            + "Анти-Флая."
+                    "Неправильный этап Анти-Флая."
             );
         }
     }
@@ -244,47 +254,55 @@ public final class AntiFlyHandler {
     ) {
         if (!ActionController.isActive(
                 ActionType.ANTI_FLY
-        ) || message == null) {
+        )
+                || message == null
+                || !offhandPrepared) {
             return;
         }
 
-        String normalizedMessage =
-                ItemNames.normalize(
-                        message.getString()
-                );
-
-        boolean success =
-                normalizedMessage.contains(
-                        ItemNames.normalize(
-                                "успешно использовано"
-                        )
-                )
-                || normalizedMessage.contains(
-                        ItemNames.normalize(
-                                "успешно активировано"
-                        )
-                )
-                || normalizedMessage.contains(
-                        ItemNames.normalize(
-                                "анти-флай успешно"
-                        )
-                )
-                || normalizedMessage.contains(
-                        ItemNames.normalize(
-                                "антиполет успешно"
-                        )
-                );
-
-        if (!success) {
-            return;
-        }
+        String text = ItemNames.normalize(
+                message.getString()
+        );
 
         /*
-         * Сообщение считается подтверждением только
-         * после помещения предмета во вторую руку.
+         * Распознаются, например:
+         *
+         * "Анти-Флай перезарядка 15 секунд"
+         * "Анти-Флай успешно использован"
+         * "Анти-Флай успешно активирован"
          */
-        if (offhandPrepared) {
-            serverConfirmed = true;
+        boolean containsAntiFly =
+                text.contains("анти-флай")
+                        || text.contains("анти флай")
+                        || text.contains("антиполет");
+
+        boolean containsSuccess =
+                text.contains("перезарядка")
+                        || text.contains("успешно")
+                        || text.contains("использован")
+                        || text.contains("активирован");
+
+        if (!containsAntiFly || !containsSuccess) {
+            return;
+        }
+
+        serverConfirmed = true;
+
+        /*
+         * Как только сервер прислал подтверждение,
+         * прекращаем ожидание и сразу начинаем возврат.
+         */
+        if (stage
+                == ActionStage.ANTI_FLY_HOLD_SNEAK
+                || stage
+                == ActionStage.ANTI_FLY_RELEASE_SNEAK
+                || stage
+                == ActionStage
+                .ANTI_FLY_WAIT_FOR_SERVER_CONFIRMATION) {
+            stage =
+                    ActionStage.ANTI_FLY_RESTORE_OFFHAND;
+
+            delayTicks = 1;
         }
     }
 
@@ -313,12 +331,15 @@ public final class AntiFlyHandler {
 
     private static void prepareSneak() {
         stage = ActionStage.ANTI_FLY_PRESS_SNEAK;
-        delayTicks = 1;
+        delayTicks = 0;
     }
 
     private static void pressSneak(
             MinecraftClient client
     ) {
+        /*
+         * Перед Shift ещё раз проверяем offhand.
+         */
         if (!matcher.test(
                 client.player.getOffHandStack()
         )) {
@@ -349,6 +370,18 @@ public final class AntiFlyHandler {
     ) {
         safelyReleaseSneak(client);
 
+        /*
+         * Если подтверждение уже пришло во время
+         * удержания Shift, сразу возвращаем предмет.
+         */
+        if (serverConfirmed) {
+            stage =
+                    ActionStage.ANTI_FLY_RESTORE_OFFHAND;
+
+            delayTicks = 1;
+            return;
+        }
+
         stage =
                 ActionStage.ANTI_FLY_RELEASE_SNEAK;
 
@@ -360,7 +393,7 @@ public final class AntiFlyHandler {
             stage =
                     ActionStage.ANTI_FLY_RESTORE_OFFHAND;
 
-            delayTicks = 2;
+            delayTicks = 1;
             return;
         }
 
@@ -370,31 +403,13 @@ public final class AntiFlyHandler {
                 ActionStage
                         .ANTI_FLY_WAIT_FOR_SERVER_CONFIRMATION;
 
-        delayTicks = 1;
+        delayTicks = 0;
     }
 
-    private static void waitForServerConfirmation(
-            MinecraftClient client
-    ) {
-        if (serverConfirmed) {
-            stage =
-                    ActionStage.ANTI_FLY_RESTORE_OFFHAND;
-
-            delayTicks = 2;
-            return;
-        }
-
-        confirmationTicks++;
-
-        if (confirmationTicks
+    private static void waitForServerConfirmation() {
+        if (serverConfirmed
+                || confirmationTicks
                 >= CONFIRM_TIMEOUT_TICKS) {
-            ItemHotkeysClient.showMessage(
-                    client,
-                    "§eСерверное подтверждение "
-                            + "не получено. Возвращаю "
-                            + displayName + "."
-            );
-
             stage =
                     ActionStage.ANTI_FLY_RESTORE_OFFHAND;
 
@@ -402,7 +417,8 @@ public final class AntiFlyHandler {
             return;
         }
 
-        delayTicks = 1;
+        confirmationTicks++;
+        delayTicks = 0;
     }
 
     private static void restoreOffhand(
@@ -411,18 +427,17 @@ public final class AntiFlyHandler {
         safelyReleaseSneak(client);
 
         /*
-         * Выполняем обратный обмен даже если Анти-Флай
-         * был израсходован.
+         * Один обратный обмен:
          *
-         * Это необходимо, чтобы предмет, который раньше
-         * лежал во второй руке, вернулся из исходного
-         * слота обратно в offhand.
+         * offhand ↔ исходный слот.
          */
-        if (offhandPrepared) {
+        if (!restoreSent && offhandPrepared) {
             InventoryUtil.swapInventorySlotWithOffhand(
                     client,
                     sourceInventoryIndex
             );
+
+            restoreSent = true;
         }
 
         stage =
@@ -435,7 +450,7 @@ public final class AntiFlyHandler {
         stage =
                 ActionStage.ANTI_FLY_VERIFY_RESTORE;
 
-        delayTicks = 1;
+        delayTicks = 0;
     }
 
     private static void verifyRestore(
@@ -449,15 +464,21 @@ public final class AntiFlyHandler {
          * во второй руке.
          */
         if (matcher.test(offhandStack)) {
-            ItemHotkeysClient.showMessage(
+            /*
+             * Выполняется одна дополнительная попытка.
+             */
+            InventoryUtil.swapInventorySlotWithOffhand(
                     client,
-                    "§cНе удалось подтвердить возврат "
-                            + "Анти-Флая."
+                    sourceInventoryIndex
             );
+
+            stage = ActionStage.FINISH;
+            delayTicks = OFFHAND_RESTORE_DELAY;
+            return;
         }
 
         stage = ActionStage.FINISH;
-        delayTicks = 2;
+        delayTicks = 1;
     }
 
     private static void finish(
@@ -466,14 +487,21 @@ public final class AntiFlyHandler {
         safelyReleaseSneak(client);
         restoreInputState(client);
 
+        /*
+         * Отключаем визуальное скрытие только после
+         * завершения настоящего возврата.
+         */
+        VisualSwapState.end();
+
         clearState();
-        ActionController.finish();
+        ActionController.finish(5);
     }
 
     public static void recover(
             MinecraftClient client
     ) {
         if (client == null || client.player == null) {
+            VisualSwapState.end();
             clearState();
             return;
         }
@@ -481,13 +509,15 @@ public final class AntiFlyHandler {
         safelyReleaseSneak(client);
 
         /*
-         * Обратный SWAP выполняем только если ранее
-         * было подтверждено успешное помещение
-         * Анти-Флая во вторую руку.
+         * При аварии возвращаем предмет только если
+         * Анти-Флай точно находится в offhand.
          */
-        if (offhandPrepared
+        if (matcher != null
                 && InventoryUtil.isInventoryIndex(
                         sourceInventoryIndex
+                )
+                && matcher.test(
+                        client.player.getOffHandStack()
                 )) {
             InventoryUtil.swapInventorySlotWithOffhand(
                     client,
@@ -496,6 +526,13 @@ public final class AntiFlyHandler {
         }
 
         restoreInputState(client);
+
+        /*
+         * Визуальный режим обязательно отключается
+         * даже при ошибке.
+         */
+        VisualSwapState.end();
+
         clearState();
     }
 
@@ -533,19 +570,18 @@ public final class AntiFlyHandler {
         );
 
         /*
-         * Возвращаем исходное состояние Shift.
+         * Возвращаем Shift в исходное состояние.
          */
-        if (sneakWasPressed) {
+        if (sneakWasPressed
+                && client.player != null
+                && client.getNetworkHandler() != null) {
             client.options.sneakKey.setPressed(true);
 
-            if (client.player != null
-                    && client.getNetworkHandler() != null) {
-                sendSneakPacket(
-                        client,
-                        ClientCommandC2SPacket.Mode
-                                .PRESS_SHIFT_KEY
-                );
-            }
+            sendSneakPacket(
+                    client,
+                    ClientCommandC2SPacket.Mode
+                            .PRESS_SHIFT_KEY
+            );
         } else {
             client.options.sneakKey.setPressed(false);
         }
@@ -591,6 +627,7 @@ public final class AntiFlyHandler {
         sneakPressedByMod = false;
         serverConfirmed = false;
         offhandPrepared = false;
+        restoreSent = false;
 
         delayTicks = 0;
         totalTicks = 0;
