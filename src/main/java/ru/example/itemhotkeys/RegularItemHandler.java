@@ -9,15 +9,25 @@ import java.util.function.Predicate;
 
 public final class RegularItemHandler {
     /*
-     * 20 игровых тиков = примерно 1 секунда.
+     * Быстрая схема для:
+     *
+     * - Эндер-ловушки;
+     * - обычной Ловушки;
+     * - Ливалки.
+     *
+     * 1 тик Minecraft приблизительно равен 0,05 секунды.
      */
-    private static final int INVENTORY_SWAP_DELAY = 6;
-    private static final int SLOT_SELECT_DELAY = 6;
-    private static final int AFTER_USE_DELAY = 6;
-    private static final int SLOT_RESTORE_DELAY = 7;
-    private static final int INVENTORY_RESTORE_DELAY = 7;
+    private static final int INVENTORY_SWAP_DELAY = 1;
+    private static final int SLOT_SELECT_DELAY = 1;
+    private static final int AFTER_USE_DELAY = 1;
+    private static final int SLOT_RESTORE_DELAY = 1;
+    private static final int INVENTORY_RESTORE_DELAY = 2;
 
-    private static final int ACTION_TIMEOUT_TICKS = 100;
+    /*
+     * Максимальное время выполнения операции.
+     * 50 тиков — примерно 2,5 секунды.
+     */
+    private static final int ACTION_TIMEOUT_TICKS = 50;
 
     private static Predicate<ItemStack> matcher;
     private static String displayName;
@@ -49,8 +59,9 @@ public final class RegularItemHandler {
         }
 
         if (!canWork(client)) {
+            VisualSwapState.end();
             clearState();
-            ActionController.finish(10);
+            ActionController.finish(5);
             return;
         }
 
@@ -69,8 +80,9 @@ public final class RegularItemHandler {
                             + itemDisplayName
             );
 
+            VisualSwapState.end();
             clearState();
-            ActionController.finish(10);
+            ActionController.finish(5);
             return;
         }
 
@@ -81,8 +93,16 @@ public final class RegularItemHandler {
         originalSelectedSlot = inventory.selectedSlot;
 
         /*
-         * На время последовательности прекращаем
-         * конфликтующие действия ЛКМ и ПКМ.
+         * Запоминаем предметы, которые игрок видел
+         * в основной и второстепенной руках.
+         *
+         * Пока операция выполняется, mixin продолжит
+         * отображать именно эти предметы.
+         */
+        VisualSwapState.begin();
+
+        /*
+         * Запоминаем, были ли зажаты ЛКМ и ПКМ.
          */
         attackWasPressed =
                 client.options.attackKey.isPressed();
@@ -90,22 +110,28 @@ public final class RegularItemHandler {
         useWasPressed =
                 client.options.useKey.isPressed();
 
+        /*
+         * На время автоматического использования
+         * прекращаем конфликтующие действия.
+         */
         client.options.attackKey.setPressed(false);
         client.options.useKey.setPressed(false);
 
         if (foundIndex >= 0 && foundIndex <= 8) {
             /*
              * Предмет уже находится в хотбаре.
+             * Переставлять его из инвентаря не нужно.
              */
             actionHotbarSlot = foundIndex;
             movedFromInventory = false;
-
-            delayTicks = 2;
+            delayTicks = 0;
         } else {
             /*
              * Предмет находится в основной части
-             * инвентаря. Временно переносим его
-             * в отдельный слот хотбара.
+             * инвентаря.
+             *
+             * Временно меняем его местами с отдельным
+             * слотом хотбара.
              */
             actionHotbarSlot =
                     InventoryUtil.findTemporaryHotbarSlot(
@@ -147,6 +173,13 @@ public final class RegularItemHandler {
         }
 
         if (!canWork(client)) {
+            /*
+             * Если игрок вышел с сервера или соединение
+             * пропало, пакеты восстановления уже отправить
+             * нельзя. Но визуальный режим необходимо
+             * обязательно отключить.
+             */
+            VisualSwapState.end();
             clearState();
             ActionController.resetWithoutRecovery();
             return;
@@ -208,8 +241,7 @@ public final class RegularItemHandler {
 
             default -> ActionController.cancel(
                     client,
-                    "Получен неправильный этап "
-                            + "обычного предмета."
+                    "Неправильный этап обычного предмета."
             );
         }
     }
@@ -224,8 +256,11 @@ public final class RegularItemHandler {
                 );
 
         /*
-         * Не используем предмет, пока точно
-         * не увидим его в подготовленном слоте.
+         * Пока нужный предмет реально не появился
+         * во временном слоте, ПКМ не отправляется.
+         *
+         * Это защищает от использования меча или первого
+         * предмета хотбара при рассинхронизации.
          */
         if (!matcher.test(preparedStack)) {
             ActionController.cancel(
@@ -236,6 +271,11 @@ public final class RegularItemHandler {
             return;
         }
 
+        /*
+         * Серверу отправляется настоящая смена слота,
+         * но визуально игрок продолжает видеть старый
+         * предмет благодаря VisualSwapState и mixin.
+         */
         InventoryUtil.selectHotbarSlot(
                 client,
                 actionHotbarSlot
@@ -253,10 +293,6 @@ public final class RegularItemHandler {
         ItemStack mainHandStack =
                 client.player.getMainHandStack();
 
-        /*
-         * Защита от использования первого или другого
-         * предмета при рассинхронизации.
-         */
         if (!matcher.test(mainHandStack)) {
             ActionController.cancel(
                     client,
@@ -267,7 +303,7 @@ public final class RegularItemHandler {
         }
 
         stage = ActionStage.REGULAR_USE_ITEM;
-        delayTicks = 1;
+        delayTicks = 0;
     }
 
     private static void useItem(
@@ -277,7 +313,8 @@ public final class RegularItemHandler {
                 client.player.getMainHandStack();
 
         /*
-         * Повторная проверка непосредственно перед ПКМ.
+         * Повторная проверка выполняется непосредственно
+         * перед использованием.
          */
         if (!matcher.test(mainHandStack)) {
             ActionController.cancel(
@@ -302,12 +339,15 @@ public final class RegularItemHandler {
         stage =
                 ActionStage.REGULAR_RESTORE_SELECTED_SLOT;
 
-        delayTicks = 1;
+        delayTicks = 0;
     }
 
     private static void restoreSelectedSlot(
             MinecraftClient client
     ) {
+        /*
+         * Возвращаем настоящий выбранный слот.
+         */
         InventoryUtil.selectHotbarSlot(
                 client,
                 originalSelectedSlot
@@ -322,14 +362,14 @@ public final class RegularItemHandler {
     private static void prepareInventoryRestore() {
         if (!movedFromInventory) {
             stage = ActionStage.FINISH;
-            delayTicks = 2;
+            delayTicks = 0;
             return;
         }
 
         stage =
                 ActionStage.REGULAR_RESTORE_INVENTORY;
 
-        delayTicks = 1;
+        delayTicks = 0;
     }
 
     private static void restoreInventory(
@@ -342,12 +382,14 @@ public final class RegularItemHandler {
                 );
 
         /*
-         * Если предмет не израсходовался, он должен
-         * находиться во временном слоте.
+         * Допустимые состояния временного слота:
          *
-         * Если предмет одноразовый и исчез, обмен всё
-         * равно необходим, чтобы вернуть исходный предмет
-         * временного слота обратно.
+         * 1. В нём всё ещё находится нужный предмет.
+         * 2. Он пустой, если предмет был одноразовым
+         *    и полностью израсходовался.
+         *
+         * Если там появился посторонний предмет,
+         * слепой обмен не выполняется.
          */
         if (!temporaryStack.isEmpty()
                 && !matcher.test(temporaryStack)) {
@@ -375,7 +417,7 @@ public final class RegularItemHandler {
         stage =
                 ActionStage.REGULAR_VERIFY_RESTORE;
 
-        delayTicks = 1;
+        delayTicks = 0;
     }
 
     private static void verifyInventoryRestore(
@@ -388,50 +430,70 @@ public final class RegularItemHandler {
                 );
 
         /*
-         * Если специальный предмет по-прежнему находится
-         * во временном хотбаре, сервер не подтвердил
-         * обратный обмен.
+         * Если специальный предмет всё ещё остался
+         * во временном хотбаре, выполняется только одна
+         * дополнительная попытка возврата.
          */
         if (matcher.test(temporaryStack)) {
-            ItemHotkeysClient.showMessage(
+            InventoryUtil.swapInventorySlotWithHotbar(
                     client,
-                    "§cНе удалось подтвердить возврат: "
-                            + displayName
+                    sourceInventoryIndex,
+                    actionHotbarSlot
             );
         }
 
         stage = ActionStage.FINISH;
-        delayTicks = 2;
+        delayTicks = 1;
     }
 
     private static void finish(
             MinecraftClient client
     ) {
+        /*
+         * Сначала возвращаем управление игроку.
+         */
         restoreInputState(client);
+
+        /*
+         * Затем отключаем визуальную подмену.
+         * К этому моменту настоящий предмет и выбранный
+         * слот уже должны быть возвращены.
+         */
+        VisualSwapState.end();
+
         clearState();
-        ActionController.finish();
+
+        /*
+         * Небольшой кулдаун защищает от спама биндами.
+         */
+        ActionController.finish(4);
     }
 
     public static void recover(
             MinecraftClient client
     ) {
         if (client == null || client.player == null) {
+            VisualSwapState.end();
             clearState();
             return;
         }
 
         /*
-         * Всегда возвращаем прежний выбранный слот.
+         * Возвращаем исходный выбранный слот.
          */
-        InventoryUtil.selectHotbarSlot(
-                client,
+        if (InventoryUtil.isHotbarSlot(
                 originalSelectedSlot
-        );
+        )) {
+            InventoryUtil.selectHotbarSlot(
+                    client,
+                    originalSelectedSlot
+            );
+        }
 
         /*
-         * При аварии выполняем обратный обмен только
-         * тогда, когда специальный предмет точно виден
-         * во временном слоте.
+         * При аварийном восстановлении выполняем обмен
+         * только тогда, когда нужный предмет точно
+         * находится во временном слоте.
          */
         if (movedFromInventory
                 && matcher != null
@@ -457,6 +519,14 @@ public final class RegularItemHandler {
         }
 
         restoreInputState(client);
+
+        /*
+         * Даже если восстановление не удалось,
+         * визуальная подмена должна быть выключена,
+         * иначе старый меч останется нарисован навсегда.
+         */
+        VisualSwapState.end();
+
         clearState();
     }
 
@@ -502,4 +572,4 @@ public final class RegularItemHandler {
         delayTicks = 0;
         totalTicks = 0;
     }
-}
+            }
