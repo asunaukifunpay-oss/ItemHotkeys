@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "itemhotkeys",
+  "version": "${version}",
+  "name": "Item Hotkeys",
+  "description": "Быстрое использование серверных предметов по горячим клавишам.",
+  "authors": [
+    "YourName"
+  ],
+  "contact": {},
+  "license": "All-Rights-Reserved",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "ru.example.itemhotkeys.ItemHotkeysClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.10",
+    "minecraft": "~1.21.4",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
