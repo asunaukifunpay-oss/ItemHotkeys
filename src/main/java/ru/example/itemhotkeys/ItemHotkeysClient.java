@@ -3,19 +3,17 @@ package ru.example.itemhotkeys;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.ItemStack;
 import net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket;
-import net.minecraft.network.packet.c2s.play.PlayerActionC2SPacket;
 import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.text.Text;
 import net.minecraft.util.Hand;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Direction;
 import org.lwjgl.glfw.GLFW;
 
 import java.util.Locale;
@@ -25,12 +23,48 @@ public final class ItemHotkeysClient implements ClientModInitializer {
     private static final String CATEGORY =
             "category.itemhotkeys.binds";
 
+    /*
+     * Задержки для обычных предметов.
+     * 20 тиков Minecraft — примерно одна секунда.
+     */
+    private static final int INVENTORY_SWAP_DELAY = 6;
+    private static final int SLOT_SELECT_DELAY = 6;
+    private static final int ITEM_USE_DELAY = 6;
+    private static final int SLOT_RESTORE_DELAY = 7;
+    private static final int INVENTORY_RESTORE_DELAY = 7;
+
+    /*
+     * Задержки Анти-Флая.
+     */
+    private static final int OFFHAND_MOVE_DELAY = 7;
+    private static final int BEFORE_SNEAK_DELAY = 5;
+    private static final int SNEAK_HOLD_DELAY = 7;
+    private static final int AFTER_SNEAK_DELAY = 4;
+    private static final int OFFHAND_RESTORE_DELAY = 8;
+
+    /*
+     * Максимум 40 тиков ожидания серверного сообщения:
+     * около двух секунд.
+     */
+    private static final int SERVER_CONFIRM_TIMEOUT = 40;
+
+    /*
+     * Общая защита от спама после завершения.
+     */
+    private static final int FINAL_COOLDOWN = 20;
+
+    /*
+     * Максимальное время всей операции.
+     */
+    private static final int ACTION_TIMEOUT = 140;
+
     private static KeyBinding enderTrapKey;
     private static KeyBinding trapKey;
     private static KeyBinding livalkaKey;
     private static KeyBinding antiFlyKey;
 
     private static PendingAction pendingAction;
+    private static int cooldownTicks;
 
     @Override
     public void onInitializeClient() {
@@ -57,6 +91,15 @@ public final class ItemHotkeysClient implements ClientModInitializer {
         ClientTickEvents.END_CLIENT_TICK.register(
                 ItemHotkeysClient::onEndClientTick
         );
+
+        /*
+         * Получаем системные сообщения сервера.
+         * Сообщение продолжает нормально отображаться игроку.
+         */
+        ClientReceiveMessageEvents.GAME.register(
+                (message, overlay) ->
+                        onServerGameMessage(message)
+        );
     }
 
     private static KeyBinding registerKey(
@@ -76,24 +119,44 @@ public final class ItemHotkeysClient implements ClientModInitializer {
     private static void onEndClientTick(
             MinecraftClient client
     ) {
-        tickPendingAction(client);
+        if (cooldownTicks > 0) {
+            cooldownTicks--;
+        }
 
-        if (!canStartAction(client) || pendingAction != null) {
+        /*
+         * Пока операция выполняется, новые нажатия
+         * не принимаются и не сохраняются в очереди.
+         */
+        if (pendingAction != null) {
+            tickPendingAction(client);
             clearQueuedKeyPresses();
             return;
         }
 
-        while (enderTrapKey.wasPressed()) {
-            startItemAction(
-                    client,
-                    itemNameContains("Эндер Ловушка"),
-                    "Эндер Ловушка",
-                    ActivationType.RIGHT_CLICK
-            );
+        if (cooldownTicks > 0 || !canStartAction(client)) {
+            clearQueuedKeyPresses();
+            return;
         }
 
-        while (trapKey.wasPressed()) {
-            startItemAction(
+        /*
+         * За один тик можно запустить только одно действие.
+         */
+        if (enderTrapKey.wasPressed()) {
+            clearQueuedKeyPresses();
+
+            startRegularItemAction(
+                    client,
+                    itemNameContains("Эндер Ловушка"),
+                    "Эндер Ловушка"
+            );
+
+            return;
+        }
+
+        if (trapKey.wasPressed()) {
+            clearQueuedKeyPresses();
+
+            startRegularItemAction(
                     client,
                     stack -> {
                         if (stack.isEmpty()) {
@@ -110,27 +173,82 @@ public final class ItemHotkeysClient implements ClientModInitializer {
                                 normalize("Эндер Ловушка")
                         );
                     },
-                    "Ловушка",
-                    ActivationType.RIGHT_CLICK
+                    "Ловушка"
             );
+
+            return;
         }
 
-        while (livalkaKey.wasPressed()) {
-            startItemAction(
+        if (livalkaKey.wasPressed()) {
+            clearQueuedKeyPresses();
+
+            startRegularItemAction(
                     client,
                     itemNameContains("Ливалка"),
-                    "Ливалка",
-                    ActivationType.RIGHT_CLICK
+                    "Ливалка"
             );
+
+            return;
         }
 
-        while (antiFlyKey.wasPressed()) {
-            startItemAction(
+        if (antiFlyKey.wasPressed()) {
+            clearQueuedKeyPresses();
+
+            startAntiFlyAction(
                     client,
                     itemNameContains("Анти-Флай"),
-                    "Анти-Флай",
-                    ActivationType.ANTI_FLY
+                    "Анти-Флай"
             );
+        }
+    }
+
+    /*
+     * Вызывается при получении системного сообщения сервера.
+     */
+    private static void onServerGameMessage(Text message) {
+        if (pendingAction == null
+                || pendingAction.type != ActionType.ANTI_FLY) {
+            return;
+        }
+
+        String normalizedMessage = normalize(
+                message.getString()
+        );
+
+        /*
+         * Основной вариант сообщения с сервера.
+         * Дополнительные варианты оставлены на случай,
+         * если текст немного отличается.
+         */
+        boolean success =
+                normalizedMessage.contains(
+                        normalize("успешно использовано")
+                )
+                || normalizedMessage.contains(
+                        normalize("успешно активировано")
+                )
+                || normalizedMessage.contains(
+                        normalize("анти-флай успешно")
+                )
+                || normalizedMessage.contains(
+                        normalize("антиполет успешно")
+                );
+
+        if (!success) {
+            return;
+        }
+
+        /*
+         * Не реагируем на старые сообщения, полученные
+         * до фактического нажатия Shift.
+         */
+        if (pendingAction.stage
+                == ActionStage.ANTI_FLY_HOLD_SNEAK
+                || pendingAction.stage
+                == ActionStage.ANTI_FLY_RELEASE_SNEAK
+                || pendingAction.stage
+                == ActionStage.ANTI_FLY_WAIT_CONFIRM) {
+            pendingAction.serverConfirmed = true;
         }
     }
 
@@ -152,16 +270,17 @@ public final class ItemHotkeysClient implements ClientModInitializer {
     }
 
     private static void clearQueuedKeyPresses() {
-        while (enderTrapKey.wasPressed()) {
-        }
+        clearKeyQueue(enderTrapKey);
+        clearKeyQueue(trapKey);
+        clearKeyQueue(livalkaKey);
+        clearKeyQueue(antiFlyKey);
+    }
 
-        while (trapKey.wasPressed()) {
-        }
-
-        while (livalkaKey.wasPressed()) {
-        }
-
-        while (antiFlyKey.wasPressed()) {
+    private static void clearKeyQueue(
+            KeyBinding keyBinding
+    ) {
+        while (keyBinding.wasPressed()) {
+            // Удаляем накопившиеся нажатия.
         }
     }
 
@@ -191,11 +310,14 @@ public final class ItemHotkeysClient implements ClientModInitializer {
                 .toLowerCase(Locale.ROOT);
     }
 
-    private static void startItemAction(
+    /*
+     * Обычные предметы:
+     * ловушки и Ливалка временно проходят через хотбар.
+     */
+    private static void startRegularItemAction(
             MinecraftClient client,
             Predicate<ItemStack> matcher,
-            String displayName,
-            ActivationType activationType
+            String displayName
     ) {
         PlayerInventory inventory =
                 client.player.getInventory();
@@ -203,25 +325,23 @@ public final class ItemHotkeysClient implements ClientModInitializer {
         int sourceIndex = findItem(inventory, matcher);
 
         if (sourceIndex < 0) {
-            client.player.sendMessage(
-                    Text.literal(
-                            "§c[Item Hotkeys] Не найден предмет: "
-                                    + displayName
-                    ),
-                    true
+            showMessage(
+                    client,
+                    "§cНе найден предмет: " + displayName
             );
 
+            cooldownTicks = 10;
             return;
         }
 
         int originalSelectedSlot = inventory.selectedSlot;
 
         int actionHotbarSlot;
-        boolean itemMovedToHotbar;
+        boolean movedFromInventory;
 
         if (sourceIndex >= 0 && sourceIndex < 9) {
             actionHotbarSlot = sourceIndex;
-            itemMovedToHotbar = false;
+            movedFromInventory = false;
         } else {
             actionHotbarSlot = findTemporaryHotbarSlot(
                     inventory,
@@ -234,24 +354,108 @@ public final class ItemHotkeysClient implements ClientModInitializer {
                     actionHotbarSlot
             );
 
-            itemMovedToHotbar = true;
+            movedFromInventory = true;
         }
 
-        selectHotbarSlot(client, actionHotbarSlot);
-
-        boolean playerWasSneaking =
-                client.player.isSneaking();
-
-        pendingAction = new PendingAction(
-                activationType == ActivationType.RIGHT_CLICK
-                        ? ActionStage.USE_RIGHT_CLICK
-                        : ActionStage.SWAP_TO_OFFHAND,
+        pendingAction = PendingAction.regularItem(
+                matcher,
+                displayName,
                 sourceIndex,
                 originalSelectedSlot,
                 actionHotbarSlot,
-                itemMovedToHotbar,
-                playerWasSneaking,
-                1
+                movedFromInventory,
+                INVENTORY_SWAP_DELAY
+        );
+    }
+
+    /*
+     * Анти-Флай:
+     *
+     * Хотбар и основная рука не используются.
+     * Предмет напрямую меняется местами со второй рукой.
+     */
+    private static void startAntiFlyAction(
+            MinecraftClient client,
+            Predicate<ItemStack> matcher,
+            String displayName
+    ) {
+        PlayerInventory inventory =
+                client.player.getInventory();
+
+        int sourceIndex = findItem(inventory, matcher);
+
+        if (sourceIndex < 0) {
+            showMessage(
+                    client,
+                    "§cНе найден предмет: " + displayName
+            );
+
+            cooldownTicks = 10;
+            return;
+        }
+
+        /*
+         * Не запускаем повторно, если Анти-Флай
+         * уже находится во второй руке.
+         */
+        if (matcher.test(client.player.getOffHandStack())) {
+            showMessage(
+                    client,
+                    "§eАнти-Флай уже находится "
+                            + "во второстепенной руке."
+            );
+
+            cooldownTicks = 10;
+            return;
+        }
+
+        boolean attackWasPressed =
+                client.options.attackKey.isPressed();
+
+        boolean useWasPressed =
+                client.options.useKey.isPressed();
+
+        boolean sneakWasPressed =
+                client.options.sneakKey.isPressed()
+                        || client.player.isSneaking();
+
+        /*
+         * На время короткой последовательности отключаем
+         * конфликтующие действия.
+         */
+        client.options.attackKey.setPressed(false);
+        client.options.useKey.setPressed(false);
+
+        if (sneakWasPressed) {
+            client.options.sneakKey.setPressed(false);
+
+            sendSneakPacket(
+                    client,
+                    ClientCommandC2SPacket.Mode
+                            .RELEASE_SHIFT_KEY
+            );
+        }
+
+        /*
+         * SWAP с кнопкой 40 означает обмен выбранного
+         * экранного слота со второстепенной рукой.
+         *
+         * Предмет, который уже был во второй руке,
+         * временно попадёт в исходный слот Анти-Флая.
+         */
+        swapInventorySlotWithOffhand(
+                client,
+                sourceIndex
+        );
+
+        pendingAction = PendingAction.antiFly(
+                matcher,
+                displayName,
+                sourceIndex,
+                attackWasPressed,
+                useWasPressed,
+                sneakWasPressed,
+                OFFHAND_MOVE_DELAY
         );
     }
 
@@ -276,22 +480,28 @@ public final class ItemHotkeysClient implements ClientModInitializer {
 
     private static int findTemporaryHotbarSlot(
             PlayerInventory inventory,
-            int originalSelectedSlot
+            int selectedSlot
     ) {
+        /*
+         * Предпочитаем пустой слот.
+         */
         for (int slot = 0; slot < 9; slot++) {
-            if (slot != originalSelectedSlot
+            if (slot != selectedSlot
                     && inventory.getStack(slot).isEmpty()) {
                 return slot;
             }
         }
 
+        /*
+         * Если пустого нет, берём любой другой слот.
+         */
         for (int slot = 0; slot < 9; slot++) {
-            if (slot != originalSelectedSlot) {
+            if (slot != selectedSlot) {
                 return slot;
             }
         }
 
-        return originalSelectedSlot;
+        return selectedSlot;
     }
 
     private static void tickPendingAction(
@@ -302,8 +512,18 @@ public final class ItemHotkeysClient implements ClientModInitializer {
         }
 
         if (!canContinueAction(client)) {
-            safelyReleaseSneak(client);
             pendingAction = null;
+            cooldownTicks = FINAL_COOLDOWN;
+            return;
+        }
+
+        pendingAction.totalTicks++;
+
+        if (pendingAction.totalTicks > ACTION_TIMEOUT) {
+            abortAction(
+                    client,
+                    "Действие отменено из-за тайм-аута."
+            );
             return;
         }
 
@@ -313,133 +533,112 @@ public final class ItemHotkeysClient implements ClientModInitializer {
         }
 
         switch (pendingAction.stage) {
-            case USE_RIGHT_CLICK ->
-                    useItemWithRightClick(client);
+            /*
+             * Обычные предметы.
+             */
+            case REGULAR_VERIFY_HOTBAR ->
+                    regularVerifyHotbar(client);
 
-            case SWAP_TO_OFFHAND ->
-                    swapAntiFlyToOffhand(client);
+            case REGULAR_WAIT_AFTER_SELECT ->
+                    regularUseItem(client);
 
-            case PRESS_SNEAK ->
-                    pressSneakForAntiFly(client);
+            case REGULAR_WAIT_AFTER_USE ->
+                    regularRestoreSelectedSlot(client);
 
-            case RELEASE_SNEAK ->
-                    releaseSneakForAntiFly(client);
+            case REGULAR_WAIT_AFTER_SLOT_RESTORE ->
+                    regularRestoreInventory(client);
 
-            case SWAP_BACK_FROM_OFFHAND ->
-                    swapAntiFlyBackFromOffhand(client);
+            case REGULAR_WAIT_AFTER_INVENTORY_RESTORE ->
+                    regularVerifyRestore(client);
 
-            case RESTORE_SELECTED_SLOT ->
-                    restoreSelectedSlot(client);
+            /*
+             * Анти-Флай.
+             */
+            case ANTI_FLY_VERIFY_OFFHAND ->
+                    antiFlyVerifyOffhand(client);
 
-            case RESTORE_INVENTORY -> {
-                restoreInventory(client);
-                pendingAction = null;
-            }
+            case ANTI_FLY_PRESS_SNEAK ->
+                    antiFlyPressSneak(client);
+
+            case ANTI_FLY_HOLD_SNEAK ->
+                    antiFlyReleaseSneak(client);
+
+            case ANTI_FLY_RELEASE_SNEAK ->
+                    antiFlyAfterSneakRelease(client);
+
+            case ANTI_FLY_WAIT_CONFIRM ->
+                    antiFlyWaitForConfirmation(client);
+
+            case ANTI_FLY_RESTORE_OFFHAND ->
+                    antiFlyRestoreOffhand(client);
+
+            case ANTI_FLY_VERIFY_RESTORE ->
+                    antiFlyVerifyRestore(client);
+
+            case FINISH ->
+                    finishAction(client);
         }
     }
 
-    private static void useItemWithRightClick(
+    /*
+     * -------------------------------------------------
+     * Обычные предметы
+     * -------------------------------------------------
+     */
+
+    private static void regularVerifyHotbar(
             MinecraftClient client
     ) {
+        ItemStack stack =
+                client.player.getInventory().getStack(
+                        pendingAction.actionHotbarSlot
+                );
+
+        if (!pendingAction.matcher.test(stack)) {
+            abortAction(
+                    client,
+                    "Не удалось подготовить: "
+                            + pendingAction.displayName
+            );
+            return;
+        }
+
+        selectHotbarSlot(
+                client,
+                pendingAction.actionHotbarSlot
+        );
+
+        pendingAction.stage =
+                ActionStage.REGULAR_WAIT_AFTER_SELECT;
+
+        pendingAction.delayTicks = SLOT_SELECT_DELAY;
+    }
+
+    private static void regularUseItem(
+            MinecraftClient client
+    ) {
+        if (!pendingAction.matcher.test(
+                client.player.getMainHandStack()
+        )) {
+            abortAction(
+                    client,
+                    "В руке оказался другой предмет."
+            );
+            return;
+        }
+
         client.interactionManager.interactItem(
                 client.player,
                 Hand.MAIN_HAND
         );
 
-        pendingAction.delayTicks = 1;
         pendingAction.stage =
-                ActionStage.RESTORE_SELECTED_SLOT;
+                ActionStage.REGULAR_WAIT_AFTER_USE;
+
+        pendingAction.delayTicks = ITEM_USE_DELAY;
     }
 
-    private static void swapAntiFlyToOffhand(
-            MinecraftClient client
-    ) {
-        sendSwapHandsPacket(client);
-
-        /*
-         * Ждём, чтобы сервер успел увидеть предмет
-         * во второстепенной руке.
-         */
-        pendingAction.delayTicks = 2;
-        pendingAction.stage = ActionStage.PRESS_SNEAK;
-    }
-
-    private static void pressSneakForAntiFly(
-            MinecraftClient client
-    ) {
-        /*
-         * Если игрок уже держит Shift, повторно нажимать
-         * и затем отпускать его нельзя.
-         */
-        if (!pendingAction.playerWasSneaking) {
-            client.options.sneakKey.setPressed(true);
-
-            client.getNetworkHandler().sendPacket(
-                    new ClientCommandC2SPacket(
-                            client.player,
-                            ClientCommandC2SPacket.Mode
-                                    .PRESS_SHIFT_KEY
-                    )
-            );
-
-            pendingAction.sneakPressedByMod = true;
-        }
-
-        /*
-         * Держим Shift несколько тиков, чтобы серверный
-         * плагин успел обработать активацию Анти-Флая.
-         */
-        pendingAction.delayTicks = 4;
-        pendingAction.stage = ActionStage.RELEASE_SNEAK;
-    }
-
-    private static void releaseSneakForAntiFly(
-            MinecraftClient client
-    ) {
-        safelyReleaseSneak(client);
-
-        /*
-         * После отпускания Shift даём серверу ещё один тик.
-         */
-        pendingAction.delayTicks = 1;
-        pendingAction.stage =
-                ActionStage.SWAP_BACK_FROM_OFFHAND;
-    }
-
-    private static void safelyReleaseSneak(
-            MinecraftClient client
-    ) {
-        if (pendingAction == null
-                || !pendingAction.sneakPressedByMod
-                || client.player == null
-                || client.getNetworkHandler() == null) {
-            return;
-        }
-
-        client.options.sneakKey.setPressed(false);
-
-        client.getNetworkHandler().sendPacket(
-                new ClientCommandC2SPacket(
-                        client.player,
-                        ClientCommandC2SPacket.Mode
-                                .RELEASE_SHIFT_KEY
-                )
-        );
-
-        pendingAction.sneakPressedByMod = false;
-    }
-
-    private static void swapAntiFlyBackFromOffhand(
-            MinecraftClient client
-    ) {
-        sendSwapHandsPacket(client);
-
-        pendingAction.delayTicks = 1;
-        pendingAction.stage =
-                ActionStage.RESTORE_SELECTED_SLOT;
-    }
-
-    private static void restoreSelectedSlot(
+    private static void regularRestoreSelectedSlot(
             MinecraftClient client
     ) {
         selectHotbarSlot(
@@ -447,15 +646,18 @@ public final class ItemHotkeysClient implements ClientModInitializer {
                 pendingAction.originalSelectedSlot
         );
 
-        pendingAction.delayTicks = 1;
         pendingAction.stage =
-                ActionStage.RESTORE_INVENTORY;
+                ActionStage.REGULAR_WAIT_AFTER_SLOT_RESTORE;
+
+        pendingAction.delayTicks = SLOT_RESTORE_DELAY;
     }
 
-    private static void restoreInventory(
+    private static void regularRestoreInventory(
             MinecraftClient client
     ) {
-        if (!pendingAction.itemMovedToHotbar) {
+        if (!pendingAction.movedFromInventory) {
+            pendingAction.stage = ActionStage.FINISH;
+            pendingAction.delayTicks = 2;
             return;
         }
 
@@ -464,108 +666,54 @@ public final class ItemHotkeysClient implements ClientModInitializer {
                 pendingAction.sourceInventoryIndex,
                 pendingAction.actionHotbarSlot
         );
+
+        pendingAction.stage =
+                ActionStage.REGULAR_WAIT_AFTER_INVENTORY_RESTORE;
+
+        pendingAction.delayTicks = INVENTORY_RESTORE_DELAY;
     }
 
-    private static void selectHotbarSlot(
-            MinecraftClient client,
-            int hotbarSlot
-    ) {
-        if (client.player.getInventory().selectedSlot
-                == hotbarSlot) {
-            return;
-        }
-
-        client.player.getInventory().selectedSlot =
-                hotbarSlot;
-
-        client.getNetworkHandler().sendPacket(
-                new UpdateSelectedSlotC2SPacket(hotbarSlot)
-        );
-    }
-
-    private static void swapInventorySlotWithHotbar(
-            MinecraftClient client,
-            int inventoryIndex,
-            int hotbarSlot
-    ) {
-        int screenSlot =
-                inventoryIndexToScreenSlot(inventoryIndex);
-
-        client.interactionManager.clickSlot(
-                client.player.currentScreenHandler.syncId,
-                screenSlot,
-                hotbarSlot,
-                SlotActionType.SWAP,
-                client.player
-        );
-    }
-
-    private static int inventoryIndexToScreenSlot(
-            int inventoryIndex
-    ) {
-        if (inventoryIndex >= 0 && inventoryIndex < 9) {
-            return 36 + inventoryIndex;
-        }
-
-        return inventoryIndex;
-    }
-
-    private static void sendSwapHandsPacket(
+    private static void regularVerifyRestore(
             MinecraftClient client
     ) {
-        client.getNetworkHandler().sendPacket(
-                new PlayerActionC2SPacket(
-                        PlayerActionC2SPacket.Action
-                                .SWAP_ITEM_WITH_OFFHAND,
-                        BlockPos.ORIGIN,
-                        Direction.DOWN
-                )
-        );
-    }
+        ItemStack temporaryHotbarStack =
+                client.player.getInventory().getStack(
+                        pendingAction.actionHotbarSlot
+                );
 
-    private enum ActivationType {
-        RIGHT_CLICK,
-        ANTI_FLY
-    }
-
-    private enum ActionStage {
-        USE_RIGHT_CLICK,
-        SWAP_TO_OFFHAND,
-        PRESS_SNEAK,
-        RELEASE_SNEAK,
-        SWAP_BACK_FROM_OFFHAND,
-        RESTORE_SELECTED_SLOT,
-        RESTORE_INVENTORY
-    }
-
-    private static final class PendingAction {
-        private ActionStage stage;
-
-        private final int sourceInventoryIndex;
-        private final int originalSelectedSlot;
-        private final int actionHotbarSlot;
-        private final boolean itemMovedToHotbar;
-        private final boolean playerWasSneaking;
-
-        private boolean sneakPressedByMod;
-        private int delayTicks;
-
-        private PendingAction(
-                ActionStage stage,
-                int sourceInventoryIndex,
-                int originalSelectedSlot,
-                int actionHotbarSlot,
-                boolean itemMovedToHotbar,
-                boolean playerWasSneaking,
-                int delayTicks
-        ) {
-            this.stage = stage;
-            this.sourceInventoryIndex = sourceInventoryIndex;
-            this.originalSelectedSlot = originalSelectedSlot;
-            this.actionHotbarSlot = actionHotbarSlot;
-            this.itemMovedToHotbar = itemMovedToHotbar;
-            this.playerWasSneaking = playerWasSneaking;
-            this.delayTicks = delayTicks;
+        /*
+         * Если предмет полностью израсходовался,
+         * совпадения уже не будет — это нормальная ситуация.
+         */
+        if (pendingAction.matcher.test(temporaryHotbarStack)) {
+            showMessage(
+                    client,
+                    "§cСервер не подтвердил возврат: "
+                            + pendingAction.displayName
+            );
         }
+
+        pendingAction.stage = ActionStage.FINISH;
+        pendingAction.delayTicks = 2;
     }
-}
+
+    /*
+     * -------------------------------------------------
+     * Анти-Флай
+     * -------------------------------------------------
+     */
+
+    private static void antiFlyVerifyOffhand(
+            MinecraftClient client
+    ) {
+        if (!pendingAction.matcher.test(
+                client.player.getOffHandStack()
+        )) {
+            abortAction(
+                    client,
+                    "Анти-Флай не переместился "
+                            + "во второстепенную руку."
+            );
+            return;
+                                                }
+        
