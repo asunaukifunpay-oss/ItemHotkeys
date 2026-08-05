@@ -14,11 +14,10 @@ import ru.example.itemhotkeys.VisualSwapState;
 @Mixin(HeldItemRenderer.class)
 public abstract class HeldItemRendererMixin {
     /*
-     * Подменяем только ItemStack, передаваемый
-     * в отрисовку от первого лица.
+     * Подменяется только ItemStack, который рисуется
+     * от первого лица.
      *
-     * Реальный инвентарь, выбранный слот и сетевые
-     * пакеты этим кодом не изменяются.
+     * Реальный инвентарь и сетевые пакеты не меняются.
      */
     @ModifyVariable(
             method = "renderFirstPersonItem",
@@ -32,7 +31,12 @@ public abstract class HeldItemRendererMixin {
             float tickDelta,
             float pitch,
             Hand hand,
-            float swingProgress
+            float swingProgress,
+            ItemStack stack,
+            float equipProgress,
+            MatrixStack matrices,
+            VertexConsumerProvider vertexConsumers,
+            int light
     ) {
         if (!VisualSwapState.isActive()) {
             return original;
@@ -40,12 +44,12 @@ public abstract class HeldItemRendererMixin {
 
         if (hand == Hand.MAIN_HAND) {
             return VisualSwapState
-                    .getVisualMainHand()
+                    .getSavedMainHand()
                     .copy();
         }
 
         return VisualSwapState
-                .getVisualOffHand()
+                .getSavedOffHand()
                 .copy();
     }
 }
