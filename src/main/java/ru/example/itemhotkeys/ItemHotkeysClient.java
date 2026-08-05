@@ -8,6 +8,7 @@ import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.ItemStack;
+import net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket;
 import net.minecraft.network.packet.c2s.play.PlayerActionC2SPacket;
 import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
 import net.minecraft.screen.slot.SlotActionType;
@@ -21,7 +22,8 @@ import java.util.Locale;
 import java.util.function.Predicate;
 
 public final class ItemHotkeysClient implements ClientModInitializer {
-    private static final String CATEGORY = "category.itemhotkeys.binds";
+    private static final String CATEGORY =
+            "category.itemhotkeys.binds";
 
     private static KeyBinding enderTrapKey;
     private static KeyBinding trapKey;
@@ -71,7 +73,9 @@ public final class ItemHotkeysClient implements ClientModInitializer {
         );
     }
 
-    private static void onEndClientTick(MinecraftClient client) {
+    private static void onEndClientTick(
+            MinecraftClient client
+    ) {
         tickPendingAction(client);
 
         if (!canStartAction(client) || pendingAction != null) {
@@ -100,8 +104,9 @@ public final class ItemHotkeysClient implements ClientModInitializer {
                                 stack.getName().getString()
                         );
 
-                        return name.contains(normalize("Ловушка"))
-                                && !name.contains(
+                        return name.contains(
+                                normalize("Ловушка")
+                        ) && !name.contains(
                                 normalize("Эндер Ловушка")
                         );
                     },
@@ -124,19 +129,23 @@ public final class ItemHotkeysClient implements ClientModInitializer {
                     client,
                     itemNameContains("Анти-Флай"),
                     "Анти-Флай",
-                    ActivationType.OFFHAND_SWAP
+                    ActivationType.ANTI_FLY
             );
         }
     }
 
-    private static boolean canStartAction(MinecraftClient client) {
+    private static boolean canStartAction(
+            MinecraftClient client
+    ) {
         return client.player != null
                 && client.interactionManager != null
                 && client.getNetworkHandler() != null
                 && client.currentScreen == null;
     }
 
-    private static boolean canContinueAction(MinecraftClient client) {
+    private static boolean canContinueAction(
+            MinecraftClient client
+    ) {
         return client.player != null
                 && client.interactionManager != null
                 && client.getNetworkHandler() != null;
@@ -207,13 +216,6 @@ public final class ItemHotkeysClient implements ClientModInitializer {
 
         int originalSelectedSlot = inventory.selectedSlot;
 
-        /*
-         * Если предмет уже находится в хотбаре,
-         * используем его текущий слот.
-         *
-         * Если он лежит в основной части инвентаря,
-         * временно помещаем его в резервный слот хотбара.
-         */
         int actionHotbarSlot;
         boolean itemMovedToHotbar;
 
@@ -235,11 +237,10 @@ public final class ItemHotkeysClient implements ClientModInitializer {
             itemMovedToHotbar = true;
         }
 
-        /*
-         * На короткое время выбираем слот с предметом.
-         * Инвентарь при этом не открывается.
-         */
         selectHotbarSlot(client, actionHotbarSlot);
+
+        boolean playerWasSneaking =
+                client.player.isSneaking();
 
         pendingAction = new PendingAction(
                 activationType == ActivationType.RIGHT_CLICK
@@ -249,6 +250,7 @@ public final class ItemHotkeysClient implements ClientModInitializer {
                 originalSelectedSlot,
                 actionHotbarSlot,
                 itemMovedToHotbar,
+                playerWasSneaking,
                 1
         );
     }
@@ -257,18 +259,12 @@ public final class ItemHotkeysClient implements ClientModInitializer {
             PlayerInventory inventory,
             Predicate<ItemStack> matcher
     ) {
-        /*
-         * Сначала проверяем хотбар.
-         */
         for (int index = 0; index < 9; index++) {
             if (matcher.test(inventory.getStack(index))) {
                 return index;
             }
         }
 
-        /*
-         * Затем основную часть инвентаря.
-         */
         for (int index = 9; index < 36; index++) {
             if (matcher.test(inventory.getStack(index))) {
                 return index;
@@ -282,10 +278,6 @@ public final class ItemHotkeysClient implements ClientModInitializer {
             PlayerInventory inventory,
             int originalSelectedSlot
     ) {
-        /*
-         * Сначала ищем пустой слот хотбара,
-         * не совпадающий с текущим выбранным слотом.
-         */
         for (int slot = 0; slot < 9; slot++) {
             if (slot != originalSelectedSlot
                     && inventory.getStack(slot).isEmpty()) {
@@ -293,11 +285,6 @@ public final class ItemHotkeysClient implements ClientModInitializer {
             }
         }
 
-        /*
-         * Если пустых слотов нет, используем соседний.
-         * Его предмет временно поменяется местами с нужным,
-         * а затем будет возвращён обратно.
-         */
         for (int slot = 0; slot < 9; slot++) {
             if (slot != originalSelectedSlot) {
                 return slot;
@@ -315,6 +302,7 @@ public final class ItemHotkeysClient implements ClientModInitializer {
         }
 
         if (!canContinueAction(client)) {
+            safelyReleaseSneak(client);
             pendingAction = null;
             return;
         }
@@ -325,9 +313,17 @@ public final class ItemHotkeysClient implements ClientModInitializer {
         }
 
         switch (pendingAction.stage) {
-            case USE_RIGHT_CLICK -> useItemWithRightClick(client);
+            case USE_RIGHT_CLICK ->
+                    useItemWithRightClick(client);
 
-            case SWAP_TO_OFFHAND -> swapAntiFlyToOffhand(client);
+            case SWAP_TO_OFFHAND ->
+                    swapAntiFlyToOffhand(client);
+
+            case PRESS_SNEAK ->
+                    pressSneakForAntiFly(client);
+
+            case RELEASE_SNEAK ->
+                    releaseSneakForAntiFly(client);
 
             case SWAP_BACK_FROM_OFFHAND ->
                     swapAntiFlyBackFromOffhand(client);
@@ -350,34 +346,92 @@ public final class ItemHotkeysClient implements ClientModInitializer {
                 Hand.MAIN_HAND
         );
 
-        /*
-         * Сразу возвращаем игроку прежний выбранный слот.
-         * Зажатую атаку мод не отпускает.
-         */
         pendingAction.delayTicks = 1;
-        pendingAction.stage = ActionStage.RESTORE_SELECTED_SLOT;
+        pendingAction.stage =
+                ActionStage.RESTORE_SELECTED_SLOT;
     }
 
     private static void swapAntiFlyToOffhand(
             MinecraftClient client
     ) {
-        /*
-         * Аналог обычного нажатия F:
-         * предмет из основной руки попадает во второстепенную.
-         */
         sendSwapHandsPacket(client);
 
+        /*
+         * Ждём, чтобы сервер успел увидеть предмет
+         * во второстепенной руке.
+         */
         pendingAction.delayTicks = 2;
+        pendingAction.stage = ActionStage.PRESS_SNEAK;
+    }
+
+    private static void pressSneakForAntiFly(
+            MinecraftClient client
+    ) {
+        /*
+         * Если игрок уже держит Shift, повторно нажимать
+         * и затем отпускать его нельзя.
+         */
+        if (!pendingAction.playerWasSneaking) {
+            client.options.sneakKey.setPressed(true);
+
+            client.getNetworkHandler().sendPacket(
+                    new ClientCommandC2SPacket(
+                            client.player,
+                            ClientCommandC2SPacket.Mode
+                                    .PRESS_SHIFT_KEY
+                    )
+            );
+
+            pendingAction.sneakPressedByMod = true;
+        }
+
+        /*
+         * Держим Shift несколько тиков, чтобы серверный
+         * плагин успел обработать активацию Анти-Флая.
+         */
+        pendingAction.delayTicks = 4;
+        pendingAction.stage = ActionStage.RELEASE_SNEAK;
+    }
+
+    private static void releaseSneakForAntiFly(
+            MinecraftClient client
+    ) {
+        safelyReleaseSneak(client);
+
+        /*
+         * После отпускания Shift даём серверу ещё один тик.
+         */
+        pendingAction.delayTicks = 1;
         pendingAction.stage =
                 ActionStage.SWAP_BACK_FROM_OFFHAND;
+    }
+
+    private static void safelyReleaseSneak(
+            MinecraftClient client
+    ) {
+        if (pendingAction == null
+                || !pendingAction.sneakPressedByMod
+                || client.player == null
+                || client.getNetworkHandler() == null) {
+            return;
+        }
+
+        client.options.sneakKey.setPressed(false);
+
+        client.getNetworkHandler().sendPacket(
+                new ClientCommandC2SPacket(
+                        client.player,
+                        ClientCommandC2SPacket.Mode
+                                .RELEASE_SHIFT_KEY
+                )
+        );
+
+        pendingAction.sneakPressedByMod = false;
     }
 
     private static void swapAntiFlyBackFromOffhand(
             MinecraftClient client
     ) {
-        /*
-         * Возвращаем предмет из второстепенной руки обратно.
-         */
         sendSwapHandsPacket(client);
 
         pendingAction.delayTicks = 1;
@@ -394,7 +448,8 @@ public final class ItemHotkeysClient implements ClientModInitializer {
         );
 
         pendingAction.delayTicks = 1;
-        pendingAction.stage = ActionStage.RESTORE_INVENTORY;
+        pendingAction.stage =
+                ActionStage.RESTORE_INVENTORY;
     }
 
     private static void restoreInventory(
@@ -404,10 +459,6 @@ public final class ItemHotkeysClient implements ClientModInitializer {
             return;
         }
 
-        /*
-         * Возвращаем нужный предмет в тот слот инвентаря,
-         * где он находился до нажатия бинда.
-         */
         swapInventorySlotWithHotbar(
                 client,
                 pendingAction.sourceInventoryIndex,
@@ -452,14 +503,6 @@ public final class ItemHotkeysClient implements ClientModInitializer {
     private static int inventoryIndexToScreenSlot(
             int inventoryIndex
     ) {
-        /*
-         * Индексы PlayerInventory:
-         * 0–8   — хотбар;
-         * 9–35  — основная часть инвентаря.
-         *
-         * В PlayerScreenHandler хотбар находится
-         * в слотах 36–44.
-         */
         if (inventoryIndex >= 0 && inventoryIndex < 9) {
             return 36 + inventoryIndex;
         }
@@ -482,12 +525,14 @@ public final class ItemHotkeysClient implements ClientModInitializer {
 
     private enum ActivationType {
         RIGHT_CLICK,
-        OFFHAND_SWAP
+        ANTI_FLY
     }
 
     private enum ActionStage {
         USE_RIGHT_CLICK,
         SWAP_TO_OFFHAND,
+        PRESS_SNEAK,
+        RELEASE_SNEAK,
         SWAP_BACK_FROM_OFFHAND,
         RESTORE_SELECTED_SLOT,
         RESTORE_INVENTORY
@@ -500,7 +545,9 @@ public final class ItemHotkeysClient implements ClientModInitializer {
         private final int originalSelectedSlot;
         private final int actionHotbarSlot;
         private final boolean itemMovedToHotbar;
+        private final boolean playerWasSneaking;
 
+        private boolean sneakPressedByMod;
         private int delayTicks;
 
         private PendingAction(
@@ -509,6 +556,7 @@ public final class ItemHotkeysClient implements ClientModInitializer {
                 int originalSelectedSlot,
                 int actionHotbarSlot,
                 boolean itemMovedToHotbar,
+                boolean playerWasSneaking,
                 int delayTicks
         ) {
             this.stage = stage;
@@ -516,6 +564,7 @@ public final class ItemHotkeysClient implements ClientModInitializer {
             this.originalSelectedSlot = originalSelectedSlot;
             this.actionHotbarSlot = actionHotbarSlot;
             this.itemMovedToHotbar = itemMovedToHotbar;
+            this.playerWasSneaking = playerWasSneaking;
             this.delayTicks = delayTicks;
         }
     }
