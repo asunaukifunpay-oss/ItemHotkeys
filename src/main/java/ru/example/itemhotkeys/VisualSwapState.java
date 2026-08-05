@@ -6,8 +6,8 @@ import net.minecraft.item.ItemStack;
 public final class VisualSwapState {
     private static boolean active;
 
-    private static ItemStack visualMainHand = ItemStack.EMPTY;
-    private static ItemStack visualOffHand = ItemStack.EMPTY;
+    private static ItemStack savedMainHand = ItemStack.EMPTY;
+    private static ItemStack savedOffHand = ItemStack.EMPTY;
 
     private VisualSwapState() {
     }
@@ -16,38 +16,36 @@ public final class VisualSwapState {
         MinecraftClient client = MinecraftClient.getInstance();
 
         if (client.player == null) {
-            clear();
+            end();
             return;
         }
 
-        visualMainHand =
-                client.player.getMainHandStack().copy();
+        savedMainHand = client.player
+                .getMainHandStack()
+                .copy();
 
-        visualOffHand =
-                client.player.getOffHandStack().copy();
+        savedOffHand = client.player
+                .getOffHandStack()
+                .copy();
 
         active = true;
     }
 
     public static void end() {
-        clear();
+        active = false;
+        savedMainHand = ItemStack.EMPTY;
+        savedOffHand = ItemStack.EMPTY;
     }
 
     public static boolean isActive() {
         return active;
     }
 
-    public static ItemStack getVisualMainHand() {
-        return visualMainHand;
+    public static ItemStack getSavedMainHand() {
+        return savedMainHand;
     }
 
-    public static ItemStack getVisualOffHand() {
-        return visualOffHand;
-    }
-
-    private static void clear() {
-        active = false;
-        visualMainHand = ItemStack.EMPTY;
-        visualOffHand = ItemStack.EMPTY;
+    public static ItemStack getSavedOffHand() {
+        return savedOffHand;
     }
 }
